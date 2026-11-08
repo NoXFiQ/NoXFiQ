@@ -40,6 +40,7 @@ cleanup_old(){
           /usr/local/bin/elite-x-packetbackup /usr/local/bin/elite-x-midnight \
           /usr/local/bin/elite-x-force-user-message /usr/local/bin/elite-x-update-user-msg
     pkill -f dnstt-server 2>/dev/null
+    # remove v7 SSH leftovers (Match blocks appended at the end of main config)
     sed -i '/^Match User/,$d' /etc/ssh/sshd_config 2>/dev/null
     sed -i '/elite-x/d' /etc/ssh/sshd_config 2>/dev/null
     rm -f /etc/ssh/sshd_config.d/elite-x-*.conf /etc/ssh/sshd_config.d/zz-elite-x-*.conf
@@ -122,13 +123,15 @@ ClientAliveCountMax 6
 PrintMotd no
 PrintLastLog no
 EOF
+    # per-user banners live in a separate file included at the END of sshd_config
+    # (so Match blocks never affect the rest of the main config)
     touch /etc/ssh/elite-x-banners.conf
     grep -q 'elite-x-banners.conf' /etc/ssh/sshd_config || \
         echo "Include /etc/ssh/elite-x-banners.conf" >> /etc/ssh/sshd_config
     sshd -t && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)
 }
 
-# ---------- 6. DNSTT (localhost:5300, EDNS proxy on port 53) ----------
+# ---------- 6. DNSTT + port 53 ----------
 setup_dnstt(){
     echo -e "${YELLOW}Installing DNSTT...${NC}"
     curl -fsSL https://dnstt.network/dnstt-server-linux-amd64 -o /usr/local/bin/dnstt-server 2>/dev/null || \
@@ -139,6 +142,7 @@ setup_dnstt(){
     echo "$STATIC_PRIVATE_KEY" > /etc/dnstt/server.key; chmod 600 /etc/dnstt/server.key
     echo "$STATIC_PUBLIC_KEY"  > /etc/dnstt/server.pub
 
+    # free port 53 from systemd-resolved stub
     if [ -f /etc/systemd/resolved.conf ]; then
         sed -i 's/^#\?DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf
         systemctl restart systemd-resolved 2>/dev/null
@@ -177,33 +181,37 @@ GLOG=$EX/global_bandwidth.log; DLOG=$EX/global_daily.log
 SSHB=/etc/ssh/elite-x-banners.conf
 mkdir -p "$UD" "$BW" "$CN" "$BAN" "$DD" "$ED" "$MS" "$PIDT" 2>/dev/null
 
+# read a field from user file (active or expired)
 gk(){ local f="$UD/$1"; [ -f "$f" ] || f="$ED/$1"; awk -F': ' -v k="$2" '$1==k{print $2; exit}' "$f" 2>/dev/null; }
 setk(){ sed -i "s|^$2: .*|$2: $3|" "$UD/$1"; }
 gb(){ awk -v b="${1:-0}" 'BEGIN{printf "%.2f", b/1073741824}'; }
 rdn(){ local v; v=$(cat "$1" 2>/dev/null | tr -d ' \n\r'); [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
 
-# one pass over sshd session processes -> CMAP[uid]=sessions
-# pgrep narrows the scan to sshd processes only (cheap on 1 vCPU)
+# one /proc scan -> CMAP[uid]=sessions
 load_conn_map(){
     declare -gA CMAP=()
-    local pid puid pp
-    for pid in $(pgrep -x sshd 2>/dev/null); do
-        pp=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null); [ "$pp" = "1" ] && continue
-        puid=$(awk '/^Uid:/{print $2}' "/proc/$pid/status" 2>/dev/null)
+    local d puid pp
+    for d in /proc/[0-9]*/; do
+        [ "$(cat "$d/comm" 2>/dev/null)" = "sshd" ] || continue
+        pp=$(awk '{print $4}' "$d/stat" 2>/dev/null); [ "$pp" = "1" ] && continue
+        puid=$(awk '/^Uid:/{print $2}' "$d/status" 2>/dev/null)
         [ -n "$puid" ] && CMAP[$puid]=$(( ${CMAP[$puid]:-0} + 1 ))
     done
 }
 
+# session pids for one uid
 sess_pids(){
-    local uid="$1" pid puid pp
+    local uid="$1" d puid pp
     [ -n "$uid" ] || return
-    for pid in $(pgrep -x sshd 2>/dev/null); do
-        pp=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null); [ "$pp" = "1" ] && continue
-        puid=$(awk '/^Uid:/{print $2}' "/proc/$pid/status" 2>/dev/null)
-        [ "$puid" = "$uid" ] && echo "$pid"
+    for d in /proc/[0-9]*/; do
+        [ "$(cat "$d/comm" 2>/dev/null)" = "sshd" ] || continue
+        pp=$(awk '{print $4}' "$d/stat" 2>/dev/null); [ "$pp" = "1" ] && continue
+        puid=$(awk '/^Uid:/{print $2}' "$d/status" 2>/dev/null)
+        [ "$puid" = "$uid" ] && basename "$d"
     done
 }
 
+# "count|ip1 ip2" for a user
 get_user_connections_by_ip(){
     local u="$1" uid p ip ips="" cnt=0
     uid=$(id -u "$u" 2>/dev/null)
@@ -218,7 +226,7 @@ LIBEOF
 chmod 644 /usr/local/lib/elite-x-lib.sh
 }
 
-# ---------- 8. Banner sync (throttled: writes/reloads only on change) ----------
+# ---------- 8. Banner sync (uses YOUR banner format) ----------
 write_banner_sync(){
 cat > /usr/local/bin/elite-x-banner-sync <<'BSEOF'
 #!/bin/bash
@@ -252,8 +260,7 @@ for f in "$UD"/*; do
     if [ "$bandwidth_gb" = "0" ]; then bw_display="Unlimited"; else bw_display="$bandwidth_gb GB"; fi
     if [ "$daily_limit" = "0" ]; then daily_display="Unlimited"; else daily_display="$daily_limit GB"; fi
 
-    if [ -f "$BW/$u.locked_quota" ] || [ -f "$BW/$u.daily_locked" ] || [ -f "$BW/$u.conn_locked" ] \
-       || passwd -S "$u" 2>/dev/null | grep -q " L "; then
+    if passwd -S "$u" 2>/dev/null | grep -q " L "; then
         status_icon="🔒"; status_text="LOCKED"
     elif [ $remaining_days -le 0 ] && [ $remaining_hours -eq 0 ]; then
         status_icon="⛔"; status_text="EXPIRED"
@@ -289,16 +296,14 @@ EOF
     printf 'Match User %s\n    Banner %s\n' "$u" "$msg_file" >> "$TMP"
 done
 
+# drop banners of users that no longer exist
 for m in "$MS"/*; do
     [ -f "$m" ] || continue
     [ -f "$UD/$(basename "$m")" ] || rm -f "$m"
 done
 
-if ! cmp -s "$TMP" "$SSHB"; then
-    install -m 644 "$TMP" "$SSHB"
-    sshd -t 2>/dev/null && { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; }
-fi
-rm -f "$TMP"
+install -m 644 "$TMP" "$SSHB"; rm -f "$TMP"
+sshd -t 2>/dev/null && { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; }
 exit 0
 BSEOF
 chmod +x /usr/local/bin/elite-x-banner-sync
@@ -364,7 +369,7 @@ chmod +x /usr/local/bin/elite-x-lock /usr/local/bin/elite-x-unlock \
          /usr/local/bin/elite-x-expire /usr/local/bin/elite-x-del
 }
 
-# ---------- 10. User CLI ----------
+# ---------- 10. User CLI (display kept as you specified) ----------
 write_user_cli(){
 cat > /usr/local/bin/elite-x-user <<'UEOF'
 #!/bin/bash
@@ -454,8 +459,7 @@ list_users(){
         days_left=$(( (expire_ts - _cur_ts) / 86400 ))
 
         local status
-        if [ -f "$BW/$u.locked_quota" ] || [ -f "$BW/$u.daily_locked" ] || [ -f "$BW/$u.conn_locked" ] \
-           || passwd -S "$u" 2>/dev/null | grep -q " L "; then status="${RED}🔒 LOCKED${NC}"
+        if passwd -S "$u" 2>/dev/null | grep -q " L "; then status="${RED}🔒 LOCKED${NC}"
         elif [ "$cc" -gt 0 ]; then status="${LIGHT_GREEN}🟢 ONLINE${NC}"; _online_users=$((_online_users+1))
         elif [ "$days_left" -le 0 ]; then status="${RED}⛔ EXPIRED${NC}"
         elif [ "$days_left" -le 3 ]; then status="${LIGHT_RED}⚠️ CRITICAL${NC}"
@@ -543,7 +547,7 @@ user_details(){
 }
 
 renew_user(){
-    local u d cur today base new
+    local u d cur base new
     u=$(ask "Username" ""); [ -z "$u" ] && return
     if [ ! -f "$UD/$u" ] && [ ! -f "$ED/$u" ]; then echo -e "${RED}Haipo${NC}"; return; fi
     d=$(ask "Siku za kuongeza" 30); [[ "$d" =~ ^[0-9]+$ ]] || d=30
@@ -679,7 +683,7 @@ UEOF
 chmod +x /usr/local/bin/elite-x-user
 }
 
-# ---------- 11. Menu ----------
+# ---------- 11. Menu (your layout) ----------
 write_menu(){
 cat > /usr/local/bin/elite-x <<'MEOF'
 #!/bin/bash
@@ -731,7 +735,7 @@ show_dashboard(){
 }
 
 server_details(){
-    local install_date script_owner total_all_bytes=0 daily_all_bytes=0 f
+    local install_date script_owner total_all_bytes=0 daily_all_bytes=0 f b
     install_date=$(cat $EX/install_date 2>/dev/null || echo "Unknown")
     script_owner="ELITE-X Team | +255713-628-668"
     for f in "$BW"/*.usage; do [ -f "$f" ] && total_all_bytes=$((total_all_bytes + $(rdn "$f"))); done
@@ -898,17 +902,18 @@ MEOF
 chmod +x /usr/local/bin/elite-x
 }
 
-# ---------- 12. EDNS proxy: single-thread epoll, one persistent backend socket ----------
+# ---------- 12. EDNS proxy (fixes FORMERR payload size) ----------
 build_edns_proxy(){
-    echo -e "${YELLOW}Compiling EDNS proxy (single-thread)...${NC}"
+    echo -e "${YELLOW}Compiling EDNS proxy...${NC}"
     cat > /tmp/elite-x-edns.c <<'CEOF'
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <signal.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -916,18 +921,14 @@ build_edns_proxy(){
 #define BACKEND_PORT 5300
 #define EDNS_SIZE    1800
 #define BUF          4096
-#define TIMEOUT_MS   3000
-#define MAX_PENDING  256
+#define MAX_INFLIGHT 64
 
-/* a pending client query waiting for the backend's reply, matched by DNS ID */
-typedef struct { unsigned short id; struct sockaddr_in cli; socklen_t clen; long long expires; int used; } pend_t;
-static pend_t P[MAX_PENDING];
-static int srv = -1, bk = -1;
+static int srv = -1;
+static int inflight = 0;
+static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 
-static long long now_ms(void){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
+typedef struct { unsigned char buf[BUF]; int len; struct sockaddr_in cli; socklen_t clen; } job_t;
+
 static int skip_name(const unsigned char *d, int off, int max){
     while (off < max){
         unsigned char l = d[off++];
@@ -937,6 +938,7 @@ static int skip_name(const unsigned char *d, int off, int max){
     }
     return max;
 }
+
 static void fix_edns(unsigned char *d, int len){
     if (len < 12) return;
     int qd = (d[4]<<8)|d[5], an = (d[6]<<8)|d[7], ns = (d[8]<<8)|d[9], ar = (d[10]<<8)|d[11];
@@ -957,76 +959,55 @@ static void fix_edns(unsigned char *d, int len){
         int rd = (d[off+8]<<8)|d[off+9]; off += 10 + rd;
     }
 }
-static void pend_add(unsigned short id, struct sockaddr_in *c, socklen_t cl){
-    int i, slot = -1; long long t = now_ms();
-    for (i = 0; i < MAX_PENDING; i++){
-        if (!P[i].used || P[i].expires < t){ slot = i; break; }
+
+static void *worker(void *arg){
+    job_t *j = arg;
+    fix_edns(j->buf, j->len);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s >= 0){
+        struct timeval tv = {3, 0};
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        struct sockaddr_in be; memset(&be, 0, sizeof be);
+        be.sin_family = AF_INET; be.sin_port = htons(BACKEND_PORT);
+        be.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sendto(s, j->buf, j->len, 0, (struct sockaddr*)&be, sizeof be);
+        unsigned char resp[BUF]; socklen_t bl = sizeof be;
+        int n = recvfrom(s, resp, BUF, 0, (struct sockaddr*)&be, &bl);
+        if (n > 0) sendto(srv, resp, n, 0, (struct sockaddr*)&j->cli, j->clen);
+        close(s);
     }
-    if (slot < 0) return;                      /* overloaded: drop */
-    P[slot].id = id; P[slot].cli = *c; P[slot].clen = cl;
-    P[slot].expires = t + TIMEOUT_MS; P[slot].used = 1;
-}
-static int pend_take(unsigned short id, struct sockaddr_in *c, socklen_t *cl){
-    int i; for (i = 0; i < MAX_PENDING; i++){
-        if (P[i].used && P[i].id == id){
-            *c = P[i].cli; *cl = P[i].clen; P[i].used = 0; return 1;
-        }
-    }
-    return 0;
+    free(j);
+    pthread_mutex_lock(&mu); inflight--; pthread_mutex_unlock(&mu);
+    return NULL;
 }
 
 int main(void){
     signal(SIGPIPE, SIG_IGN);
-    srv = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-    bk  = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-    if (srv < 0 || bk < 0){ perror("socket"); return 1; }
+    srv = socket(AF_INET, SOCK_DGRAM, 0);
     int one = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_port = htons(LISTEN_PORT); a.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(srv, (struct sockaddr*)&a, sizeof a) < 0){ perror("bind"); return 1; }
-
-    struct sockaddr_in be; memset(&be, 0, sizeof be);
-    be.sin_family = AF_INET; be.sin_port = htons(BACKEND_PORT); be.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(bk, (struct sockaddr*)&be, sizeof be) < 0){ perror("connect"); return 1; }
-
-    int ep = epoll_create1(0);
-    struct epoll_event ev = {0}; ev.events = EPOLLIN;
-    ev.data.fd = srv; epoll_ctl(ep, EPOLL_CTL_ADD, srv, &ev);
-    ev.data.fd = bk;  epoll_ctl(ep, EPOLL_CTL_ADD, bk, &ev);
-
-    unsigned char buf[BUF];
-    struct epoll_event evs[16];
     for (;;){
-        int n = epoll_wait(ep, evs, 16, 1000);
-        int i;
-        for (i = 0; i < n; i++){
-            if (evs[i].data.fd == srv){
-                /* client query -> fix EDNS -> forward to dnstt (connected socket) */
-                struct sockaddr_in c; socklen_t cl = sizeof c;
-                int r = recvfrom(srv, buf, BUF, 0, (struct sockaddr*)&c, &cl);
-                if (r < 12) continue;
-                fix_edns(buf, r);
-                unsigned short id = (buf[0] << 8) | buf[1];
-                pend_add(id, &c, cl);
-                send(bk, buf, r, 0);
-            } else if (evs[i].data.fd == bk){
-                /* backend reply -> match by ID -> back to the original client */
-                int r = recv(bk, buf, BUF, 0);
-                if (r < 12) continue;
-                unsigned short id = (buf[0] << 8) | buf[1];
-                struct sockaddr_in c; socklen_t cl;
-                if (pend_take(id, &c, &cl))
-                    sendto(srv, buf, r, 0, (struct sockaddr*)&c, cl);
-            }
+        job_t *j = malloc(sizeof *j);
+        if (!j){ sleep(1); continue; }
+        j->clen = sizeof j->cli;
+        j->len = recvfrom(srv, j->buf, BUF, 0, (struct sockaddr*)&j->cli, &j->clen);
+        if (j->len <= 0){ free(j); continue; }
+        int ok;
+        pthread_mutex_lock(&mu); ok = inflight < MAX_INFLIGHT; if (ok) inflight++; pthread_mutex_unlock(&mu);
+        if (!ok){ free(j); continue; }
+        pthread_t t; pthread_attr_t at; pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&at, 256 * 1024);
+        if (pthread_create(&t, &at, worker, j) != 0){
+            free(j); pthread_mutex_lock(&mu); inflight--; pthread_mutex_unlock(&mu);
         }
-        /* expire stale pending entries lazily */
-        long long t = now_ms(); int k;
-        for (k = 0; k < MAX_PENDING; k++) if (P[k].used && P[k].expires < t) P[k].used = 0;
+        pthread_attr_destroy(&at);
     }
 }
 CEOF
-    if gcc -O2 -o /usr/local/bin/elite-x-edns /tmp/elite-x-edns.c 2>/dev/null; then
+    if gcc -O2 -pthread -o /usr/local/bin/elite-x-edns /tmp/elite-x-edns.c 2>/dev/null; then
         echo -e "${GREEN}EDNS proxy compiled${NC}"
     else
         echo -e "${RED}EDNS proxy compile failed${NC}"
@@ -1034,7 +1015,7 @@ CEOF
     rm -f /tmp/elite-x-edns.c
 }
 
-# ---------- 13. Monitor (pgrep-based, 2-minute cycle) ----------
+# ---------- 13. Monitor (quota, daily, expiry, conn limit) ----------
 build_monitor(){
     echo -e "${YELLOW}Compiling monitor...${NC}"
     cat > /tmp/elite-x-monitor.c <<'CEOF'
@@ -1089,8 +1070,6 @@ static int find(unsigned uid){
     if (NS >= MAXS) return -1;
     S[NS].uid = uid; S[NS].sess = 0; S[NS].delta = 0; return NS++;
 }
-/* only sshd PIDs are read: list them via /proc/<pid>/comm lookup of pgrep output is done
-   by scanning /proc once, but we skip non-sshd quickly by reading comm first */
 static void scan(void){
     NS = 0;
     DIR *d = opendir("/proc"); if (!d) return;
@@ -1223,8 +1202,8 @@ int main(void){
     int tick = 0;
     while (running){
         cycle();
-        if (++tick % 5 == 0) run(LIB "elite-x-banner-sync >/dev/null 2>&1");
-        int i; for (i = 0; i < 120 && running; i++) sleep(1);
+        if (++tick % 10 == 0) run(LIB "elite-x-banner-sync >/dev/null 2>&1");
+        int i; for (i = 0; i < 60 && running; i++) sleep(1);
     }
     return 0;
 }
@@ -1357,7 +1336,7 @@ echo "NS      : $TDOMAIN"
 echo "PUBKEY  : $STATIC_PUBLIC_KEY"
 echo "Menu    : elite"
 echo "Panel   : http://$(cat $EX/cached_ip 2>/dev/null):44380"
-systemctl is-active -q dnstt-elite-x   && echo -e "${GREEN}✅ DNSTT${NC}"       || echo -e "${RED}❌ DNSTT${NC}"
-systemctl is-active -q elite-x-edns    && echo -e "${GREEN}✅ EDNS Proxy${NC}"   || echo -e "${RED}❌ EDNS Proxy${NC}"
-systemctl is-active -q elite-x-monitor && echo -e "${GREEN}✅ Monitor${NC}"     || echo -e "${RED}❌ Monitor${NC}"
+systemctl is-active -q dnstt-elite-x   && echo -e "${GREEN}✅ DNSTT${NC}"   || echo -e "${RED}❌ DNSTT${NC}"
+systemctl is-active -q elite-x-edns    && echo -e "${GREEN}✅ EDNS Proxy${NC}" || echo -e "${RED}❌ EDNS Proxy${NC}"
+systemctl is-active -q elite-x-monitor && echo -e "${GREEN}✅ Monitor${NC}" || echo -e "${RED}❌ Monitor${NC}"
 (systemctl is-active -q ssh || systemctl is-active -q sshd) && echo -e "${GREEN}✅ SSH${NC}" || echo -e "${RED}❌ SSH${NC}"
