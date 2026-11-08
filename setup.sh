@@ -845,6 +845,7 @@ uninstall_elitex(){
     rm -f /etc/systemd/system/dnstt-elite-x.service /etc/systemd/system/elite-x-*.service
     rm -f /usr/local/bin/dnstt-server /usr/local/bin/elite-x*
     rm -f /usr/local/lib/elite-x-lib.sh /etc/sysctl.d/99-elite-x.conf
+    rm -f /etc/profile.d/elite-x-dashboard.sh
     rm -f /etc/ssh/sshd_config.d/00-elite-x.conf /etc/ssh/elite-x-banners.conf
     sed -i '/elite-x-banners.conf/d' /etc/ssh/sshd_config
     rm -rf /etc/dnstt "$EX"
@@ -900,7 +901,7 @@ MEOF
 chmod +x /usr/local/bin/elite
 }
 
-# ---------- 12. EDNS proxy (single-thread epoll, fixed build) ----------
+# ---------- 12. EDNS proxy (single-thread epoll) ----------
 build_edns_proxy(){
     echo -e "${YELLOW}Compiling EDNS proxy...${NC}"
     cat > /tmp/elite-x-edns.c <<'CEOF'
@@ -1323,6 +1324,19 @@ EOF
     [ -f /etc/systemd/system/elite-x-panel.service ] && systemctl enable --now elite-x-panel >/dev/null 2>&1
 }
 
+# ---------- 15b. Auto-launch dashboard on root login ----------
+install_autolaunch(){
+    cat > /etc/profile.d/elite-x-dashboard.sh <<'EOF'
+#!/bin/bash
+# Open ELITE-X menu automatically for interactive root logins (once per session)
+if [ "$(id -u)" -eq 0 ] && [ -t 0 ] && [ -z "${ELITE_X_SHOWN:-}" ] && [ -x /usr/local/bin/elite ]; then
+    export ELITE_X_SHOWN=1
+    /usr/local/bin/elite
+fi
+EOF
+    chmod 644 /etc/profile.d/elite-x-dashboard.sh
+}
+
 # ---------- 16. Final verification ----------
 verify_install(){
     local fail=0 b s
@@ -1369,16 +1383,19 @@ build_edns_proxy
 build_monitor
 install_panel
 install_units
+install_autolaunch
 /usr/local/bin/elite-x-banner-sync
 curl -4 -s --max-time 5 icanhazip.com > $EX/cached_ip 2>/dev/null
 
 clear
 if verify_install; then
-    echo -e "${GREEN}ELITE-X LITE v7 imewekwa kikamilifu${NC}"
+    echo -e "${GREEN}ELITE-X LITE imewekwa kikamilifu${NC}"
 else
     echo -e "${RED}Install imekamilika na makosa. Tuma matokeo hapo juu.${NC}"
 fi
 echo "NS      : $TDOMAIN"
 echo "PUBKEY  : $STATIC_PUBLIC_KEY"
-echo "Menu    : elite"
 echo "Panel   : http://$(cat $EX/cached_ip 2>/dev/null):44380"
+sleep 2
+export ELITE_X_SHOWN=1
+exec /usr/local/bin/elite
